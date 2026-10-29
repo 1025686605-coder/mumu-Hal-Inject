@@ -18,13 +18,32 @@
 
 ### 方式二：单文件 .pyz（需 Python 3）
 
-双击 `run.cmd`，或直接：
+双击 `run.vbs`（无黑窗），或直接：
 
 ```powershell
 python dist\mumu_runner.pyz
 ```
 
-`.pyz` 只有 26 KB，标准库 `zipapp` 打包，源码可直接审阅。
+`.pyz` 约 128 KB，标准库 `zipapp` 打包，源码可直接审阅。
+
+### 两种形态都自带全部资源
+
+**单个文件即可独立运行，不需要任何外部文件**：
+
+| 资源 | 说明 |
+|---|---|
+| HAL 原文件 `impl_kona.so` | 打补丁的基准，从程序内部读取 |
+| 探针 `probe.apk` | 缺探针的实例会自动安装 |
+| 界面与逻辑 | `app.py` / `core.py` |
+
+- **EXE**：payload 里放在 `app/` 目录（`app/impl_kona.so`、`app/probe.apk`）
+- **pyz**：放在 zip 归档根（`mumu_runner.pyz!/impl_kona.so`）
+
+`app.read_resource()` 会按这个顺序找：**先查 zip 归档内部，再查磁盘目录**。
+归档优先是为了避免被工作目录里的同名散件掩盖，导致"打包了却没用上"。
+
+> 实测：把 `mumu_runner.pyz` 单独复制到一个空目录运行，
+> HAL 来源显示为 `xxx.pyz!/impl_kona.so`，注入正常（41.1Hz / 1233 帧）。
 
 ### 界面
 
@@ -53,6 +72,36 @@ MuMu 多开时每个实例是独立的 Android 环境，端口按规律递增（
 4. 用同一份波形同时喂给所有实例，日志按 `[实例N]` 前缀区分。
 
 多个实例的日志会交错，但每条都带实例前缀，便于定位问题。
+
+### 路径说明
+
+**代码里没有任何写死的绝对路径**：
+
+- MuMu 位置 → `app.detect_mumu()` 运行时探测，找不到就提示手动指定
+- `impl_kona.so` → `app.read_resource()` 先查 zip 归档内部，再查磁盘目录
+- `csc.exe` → `build.find_csc()` 通过 `%WINDIR%` 与环境变量定位
+- 配置文件 → 写到程序同级目录，不可写时退回 `~/.mumu-runner`
+
+因此整个目录可以随意移动或改名，换台机器也不用改代码。
+
+### 运行时不弹黑窗
+
+程序以 `pythonw`（无控制台）启动。此时如果直接用 `subprocess.run` 调 adb，
+Windows 会为每个子进程新建一个控制台窗口并闪一下——多开时尤其明显。
+
+统一走 `core.quiet_run()`，三重抑制缺一不可：
+
+| 手段 | 作用 |
+|---|---|
+| `DETACHED_PROCESS` | adb 会自己申请控制台，必须用这个才压得住 |
+| `CREATE_NO_WINDOW` | 兜底，防止个别程序仍分配控制台 |
+| `STARTUPINFO + SW_HIDE` | 子进程自己画的窗口也隐藏 |
+
+实测：完整跑一遍双开流程（部署→注入→停止→还原），`conhost` 进程数
+**从 1 到 1，零新增窗口**。
+
+另外 `find_ring` 原本用 `shell=True` 做输出重定向，那会额外拉起 `cmd.exe`；
+现在改成推脚本 + `exec-out` 直取字节，不再经过任何 shell。
 
 ### 多开端口规律
 
@@ -120,8 +169,8 @@ MuMu 多开时每个实例是完整的独立 Android 环境，adb 端口按固�
 | `impl_kona.so` | 官方原始 HAL（md5 `0bc7861a…`，补丁基准，勿改） |
 | `probe/probe.apk` | 验证探针，打印各传感器原始值（缺探针的实例会自动安装） |
 | `run.cmd` | 便捷启动器（优先 pyz，回退源码） |
-| `dist/MuMu跑步注入器.exe` | 单文件 EXE（13.5 MB，自带运行时） |
-| `dist/mumu_runner.pyz` | 单文件 pyz（30 KB，需 Python） |
+| `dist/MuMu跑步注入器.exe` | 单文件 EXE（13.5 MB，自带运行时 + HAL + 探针） |
+| `dist/mumu_runner.pyz` | 单文件 pyz（128 KB，自带 HAL 与探针，需 Python） |
 
 核心对象的职责边界：
 
@@ -145,6 +194,20 @@ python build.py --pyz-only   # 只产出 29KB 的 .pyz（无需 .NET）
   改用 `Shell.Application` COM 解压，零程序集依赖。
 - Python 运行时用 `._pth` 显式声明 `Lib` 与 `..\app` 搜索路径；
   `._pth` 存在时会忽略 `PYTHONPATH`，所以 app 目录必须写进去。
+- **第三方依赖要连传递依赖一起打**：`elftools` 依赖 `typing_extensions`，
+  只复制 `elftools` 目录会导致打包版运行时报 `ImportError`（在无 Python 的机器上
+  被误当成"需要 pip"）。`build.py` 现在显式复制这两个，并在打包末尾用
+  内置解释器做一次 `import` 自检，缺依赖会在构建阶段直接失败：
+
+  ```
+  运行时自检通过    ← 构建时打印，说明 elftools/tkinter 都能 import
+  ```
+
+自检用的命令等价于：
+
+```powershell
+runtime\python.exe -c "import elftools.elf.elffile, tkinter; print('ok')"
+```
 
 ---
 

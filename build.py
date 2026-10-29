@@ -113,15 +113,48 @@ def copy_runtime(pydir, dest):
                         '__pycache__', 'test', 'tests', 'idlelib', 'lib2to3',
                         'distutils', 'site-packages', 'ensurepip', 'venv',
                         '*.pyc', '*.pyo'))
-    # site-packages 里的 pyelftools
-    for sp in ('Lib/site-packages', 'site-packages'):
-        src = os.path.join(pydir, sp, 'elftools')
+
+    # 第三方依赖：只挑本项目真正用到的，避免把整个 site-packages 打进去。
+    # elftools 依赖 typing_extensions，漏了它运行时就会报 ImportError。
+    sp_dirs = [os.path.join(pydir, sp) for sp in ('Lib/site-packages', 'site-packages')]
+    sp_src = next((d for d in sp_dirs if os.path.isdir(d)), '')
+    if not sp_src:
+        raise SystemExit('未找到 site-packages')
+    for pkg in ('elftools', 'typing_extensions.py', 'typing_extensions'):
+        src = os.path.join(sp_src, pkg)
+        if not os.path.exists(src):
+            if pkg.startswith('elftools'):
+                raise SystemExit('未找到 elftools，请先 pip install pyelftools')
+            print(f'  [warn] 缺少依赖 {pkg}，运行可能失败')
+            continue
+        dst = os.path.join(libdst, pkg)
         if os.path.isdir(src):
-            shutil.copytree(src, os.path.join(libdst, 'elftools'), dirs_exist_ok=True,
+            shutil.copytree(src, dst, dirs_exist_ok=True,
                             ignore=shutil.ignore_patterns('__pycache__'))
-            break
-    else:
-        raise SystemExit('未找到 elftools，请先 pip install pyelftools')
+        else:
+            shutil.copy2(src, dst)
+
+    # 自检：确认打进包里的模块能真的 import
+    _verify_runtime(rt)
+
+
+def _verify_runtime(rt):
+    """用打包后的解释器自检关键模块，构建阶段就暴露缺失依赖。"""
+    py = os.path.join(rt, 'python.exe')
+    if not os.path.isfile(py):
+        return
+    code = ('import sys; '
+            'sys.path.insert(0, r"%s\\Lib"); '
+            'import elftools, elftools.elf.elffile; '
+            'import tkinter; '
+            'print("runtime-selfcheck-ok")' % rt)
+    r = subprocess.run([py, '-c', code], capture_output=True, text=True,
+                       timeout=120, cwd=rt)
+    ok = 'runtime-selfcheck-ok' in (r.stdout or '')
+    if not ok:
+        raise SystemExit('运行时自检失败，打包出来的程序会报缺模块：\n'
+                         + (r.stdout or '') + (r.stderr or ''))
+    print('  运行时自检通过')
 
     # 关键：把 Lib 与 app 目录显式加入模块搜索路径。
     # 出了标准安装布局，Python 找不到 Lib；且 ._pth 一旦存在会忽略 PYTHONPATH，
@@ -183,12 +216,24 @@ def build_exe(zip_path, out_exe):
 
 
 def build_pyz(out_pyz):
-    """单文件 .pyz（标准库 zipapp），目标机器需有 Python。"""
+    """单文件 .pyz（标准库 zipapp），目标机器需有 Python。
+
+    把 HAL 原文件与探针 APK 一并塞进 zip——zipapp 支持从归档内读资源，
+    app.py 里的 load_so() / find_probe_apk() 已经会尝试从 zip 内取。
+    """
     stage = os.path.join(BUILD, 'pyz')
     shutil.rmtree(stage, ignore_errors=True)
     os.makedirs(stage)
     for f in ('app.py', 'core.py'):
         shutil.copy2(os.path.join(HERE, f), stage)
+    # 资源：HAL 原文件 + 探针 APK（有就打进去，没有也允许构建）
+    for rel, name in (('impl_kona.so', 'impl_kona.so'),
+                      (os.path.join('probe', 'probe.apk'), 'probe.apk')):
+        src = os.path.join(HERE, rel)
+        if os.path.exists(src):
+            shutil.copy2(src, os.path.join(stage, name))
+        else:
+            print(f'  [warn] 缺少 {rel}，pyz 内将不含该资源')
     zipapp.create_archive(stage, out_pyz, main='app:main')
     return out_pyz
 

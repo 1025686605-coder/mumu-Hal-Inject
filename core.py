@@ -211,8 +211,12 @@ def make_patched_so(src_bytes):
     """关掉 RELRO 并把三处解析源指向可写缓冲，返回新 .so 字节。"""
     try:
         from elftools.elf.elffile import ELFFile
-    except ImportError:
-        raise RuntimeError('需要 pyelftools：pip install pyelftools')
+    except ImportError as e:
+        # 打包版自带 elftools，正常不会走到这里；除非用的是残缺的第三方构建
+        raise RuntimeError(
+            '缺少 pyelftools 模块（打包版应已内置）。\n'
+            f'原始错误: {e}\n'
+            '若在用源码运行，请先安装：pip install pyelftools')
 
     import io
     elf = ELFFile(io.BytesIO(src_bytes))

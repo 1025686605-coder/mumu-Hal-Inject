@@ -106,40 +106,96 @@ def base_dir():
     return os.path.dirname(os.path.abspath(__file__))
 
 
-def _find_file(names):
-    """在若干候选目录里按文件名查找，返回第一个命中的完整路径。"""
+# ---------------------------------------------------------------- 资源读取
+# 程序可能是三种形态，资源查找要都支持：
+#   1) 源码目录：impl_kona.so 就在 app.py 旁边
+#   2) .pyz     ：资源被打进 zip 归档，需从归档内读
+#   3) EXE      ：解压后的 app 目录里有文件，等同源码目录
+def in_archive():
+    """当前是否运行在 zip 归档（.pyz）里。"""
+    return bool(getattr(sys, 'frozen', False)) or os.path.isfile(
+        os.path.abspath(__file__))
+
+
+def archive_path():
+    """返回 .pyz 的路径（若在归档内运行），否则空串。"""
+    exe = getattr(sys, 'executable', '') or ''
+    if exe.lower().endswith('.pyz'):
+        return exe
+    arg = sys.argv[0] if sys.argv else ''
+    if arg.lower().endswith('.pyz'):
+        return os.path.abspath(arg)
+    return ''
+
+
+def read_resource(name):
+    """读资源，返回 (bytes 或 None, 来源描述)。
+
+    顺序很重要：
+      1) 若运行在 .pyz 归档里 —— 先查归档内部，保证用的是打包进去的那份，
+         否则会被工作目录里同名的散件掩盖，出现"打包了却没用上"的假象
+      2) 再查磁盘上的候选目录（源码/EXE 解压后的形态）
+    """
+    base = os.path.basename(name)
+
+    # a) 归档内部（.pyz 形态优先，避免被同名散件盖住）
+    zp = archive_path()
+    if zp and os.path.isfile(zp):
+        import zipfile
+        try:
+            with zipfile.ZipFile(zp) as z:
+                names = z.namelist()
+                for entry in (name, base):
+                    if entry in names:
+                        return z.read(entry), f'{zp}!/{entry}'
+                for entry in names:
+                    if os.path.basename(entry) == base:
+                        return z.read(entry), f'{zp}!/{entry}'
+        except Exception:
+            pass
+
+    # b) 磁盘上的若干候选目录
     tried = [
         base_dir(),
         os.path.dirname(base_dir()),
         os.path.dirname(os.path.abspath(sys.argv[0])) if sys.argv and sys.argv[0] else '',
         os.getcwd(),
     ]
-    seen, paths = set(), []
+    seen = set()
     for d in tried:
         if not d or d in seen:
             continue
         seen.add(d)
-        for n in names:
-            p = os.path.join(d, n)
-            paths.append(p)
-            if os.path.isfile(p):
-                return p, paths
-    return None, paths
+        for cand in (os.path.join(d, name), os.path.join(d, base),
+                     os.path.join(d, 'probe', base),
+                     os.path.join(os.path.dirname(d), name)):
+            if os.path.isfile(cand):
+                with open(cand, 'rb') as f:
+                    return f.read(), cand
+
+    return None, ''
 
 
 def load_so():
-    """读取 impl_kona.so；返回 (内容或 None, 命中路径或已尝试路径列表)。"""
-    hit, paths = _find_file(['impl_kona.so'])
-    if hit:
-        with open(hit, 'rb') as f:
-            return f.read(), hit
-    return None, paths
+    """读取 impl_kona.so；返回 (内容或 None, 来源描述)。"""
+    data, src = read_resource('impl_kona.so')
+    return data, src or '(未找到 impl_kona.so)'
 
 
 def find_probe_apk():
-    """定位探针 APK（可能在 probe/ 子目录或程序同级）。"""
-    hit, _ = _find_file(['probe.apk', os.path.join('probe', 'probe.apk')])
-    return hit or ''
+    """定位探针 APK；若来自 zip 归档则先落盘再返回路径（adb install 需要真实文件）。"""
+    data, src = read_resource('probe.apk')
+    if not data:
+        return ''
+    # 来源是磁盘上的真实文件就直接用
+    if '!/' not in src and os.path.isfile(src):
+        return src
+    # 来自归档：解压到临时文件
+    import tempfile
+    fd, tmp = tempfile.mkstemp(prefix='probe_', suffix='.apk')
+    with os.fdopen(fd, 'wb') as f:
+        f.write(data)
+    return tmp
 
 
 def data_dir():
@@ -426,8 +482,10 @@ class App:
         def job():
             so_bytes, so_src = load_so()
             if so_bytes is None:
-                raise RuntimeError('缺少 HAL 原文件 impl_kona.so，已查找:\n' +
-                                   '\n'.join(so_src))
+                raise RuntimeError(
+                    '缺少 HAL 原文件 impl_kona.so。\n'
+                    '请把它放在程序同目录，或重新用 build.py 打包进程序。')
+            self.put(f'HAL 原文件: {so_src}')
 
             fleet = core.Fleet(adb, self.put)
             self.fleet = fleet

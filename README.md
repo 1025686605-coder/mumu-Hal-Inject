@@ -73,36 +73,6 @@ MuMu 多开时每个实例是独立的 Android 环境，端口按规律递增（
 
 多个实例的日志会交错，但每条都带实例前缀，便于定位问题。
 
-### 路径说明
-
-**代码里没有任何写死的绝对路径**：
-
-- MuMu 位置 → `app.detect_mumu()` 运行时探测，找不到就提示手动指定
-- `impl_kona.so` → `app.read_resource()` 先查 zip 归档内部，再查磁盘目录
-- `csc.exe` → `build.find_csc()` 通过 `%WINDIR%` 与环境变量定位
-- 配置文件 → 写到程序同级目录，不可写时退回 `~/.mumu-runner`
-
-因此整个目录可以随意移动或改名，换台机器也不用改代码。
-
-### 运行时不弹黑窗
-
-程序以 `pythonw`（无控制台）启动。此时如果直接用 `subprocess.run` 调 adb，
-Windows 会为每个子进程新建一个控制台窗口并闪一下——多开时尤其明显。
-
-统一走 `core.quiet_run()`，三重抑制缺一不可：
-
-| 手段 | 作用 |
-|---|---|
-| `DETACHED_PROCESS` | adb 会自己申请控制台，必须用这个才压得住 |
-| `CREATE_NO_WINDOW` | 兜底，防止个别程序仍分配控制台 |
-| `STARTUPINFO + SW_HIDE` | 子进程自己画的窗口也隐藏 |
-
-实测：完整跑一遍双开流程（部署→注入→停止→还原），`conhost` 进程数
-**从 1 到 1，零新增窗口**。
-
-另外 `find_ring` 原本用 `shell=True` 做输出重定向，那会额外拉起 `cmd.exe`；
-现在改成推脚本 + `exec-out` 直取字节，不再经过任何 shell。
-
 ### 多开端口规律
 
 MuMu 多开时每个实例是完整的独立 Android 环境，adb 端口按固定步长递增：
@@ -178,38 +148,6 @@ MuMu 多开时每个实例是完整的独立 Android 环境，adb 端口按固�
 - `Session(adb_path, device=..., tag='实例N')` —— 单实例的完整流程，日志自动加前缀
 - `Fleet(adb_path)` —— 枚举实例并批量调度，内部按设备复用 `Session`
   以保住 ring/pid 等中间状态
-
-### 重新打包
-
-```powershell
-python build.py              # 产出 EXE + pyz
-python build.py --pyz-only   # 只产出 29KB 的 .pyz（无需 .NET）
-```
-
-打包要点（都是踩过的坑）：
-
-- **payload 不嵌入 .NET 资源**，而是追加在 exe 末尾（`[exe][zip][8B长度][8B魔数]`）。
-  14 MB 资源会让 `winexe` 在 `Main` 之前就加载失败。
-- **不用 `System.IO.Compression`**：`winexe` 加该引用后 `Main` 直接不执行。
-  改用 `Shell.Application` COM 解压，零程序集依赖。
-- Python 运行时用 `._pth` 显式声明 `Lib` 与 `..\app` 搜索路径；
-  `._pth` 存在时会忽略 `PYTHONPATH`，所以 app 目录必须写进去。
-- **第三方依赖要连传递依赖一起打**：`elftools` 依赖 `typing_extensions`，
-  只复制 `elftools` 目录会导致打包版运行时报 `ImportError`（在无 Python 的机器上
-  被误当成"需要 pip"）。`build.py` 现在显式复制这两个，并在打包末尾用
-  内置解释器做一次 `import` 自检，缺依赖会在构建阶段直接失败：
-
-  ```
-  运行时自检通过    ← 构建时打印，说明 elftools/tkinter 都能 import
-  ```
-
-自检用的命令等价于：
-
-```powershell
-runtime\python.exe -c "import elftools.elf.elffile, tkinter; print('ok')"
-```
-
----
 
 ## 验证
 
